@@ -1,6 +1,6 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
-use candle_core::{quantized::QMatMul, DType, Device, Result, Tensor};
+use candle_core::{quantized::QMatMul, DType, Device, Result, Tensor, IndexOp};
 use candle_nn::{embedding, linear_no_bias as linear, Embedding, Module, VarBuilder};
 use serde::Deserialize;
 use std::sync::Arc;
@@ -313,7 +313,9 @@ impl Block {
             metadata,
         )? + residual)?;
         let residual = &x;
-        let x = (self.mlp.forward(&self.rms_2.forward(&x)?)? + residual)?;
+
+        let x = self.rms_2.forward(&x)?;
+        // let x = (self.mlp.forward(&self.rms_2.forward(&x)?)? + residual)?;
         Ok(x)
     }
 
@@ -357,7 +359,9 @@ pub struct Llama {
     blocks: Vec<Block>,
     ln_f: RmsNorm,
     lm_head: QMatMul,
-    pub kv_cache: crate::pipeline::Cache,
+    pub kv_caches: Vec<crate::pipeline::Cache>,
+    cuda_devices: Vec<candle_core::Device>,
+    // pub kv_cache: crate::pipeline::Cache,
     pub device: Device,
     mapper: Box<dyn DeviceMapper + Send + Sync>,
     cfg: ModelConfigMetadata,
@@ -372,32 +376,108 @@ impl Llama {
         context_lens: Vec<(usize, usize)>,
         mut metadata: Option<(Vec<(Tensor, Tensor)>, &mut PagedAttentionInputMetadata)>,
     ) -> Result<Tensor> {
+        // println!("input_ids size {:?}", input_ids.shape());
         let mut x = self.wte.forward(input_ids)?;
-        let mut cache = self.kv_cache.lock();
-        let mask = CausalMasker.make_causal_mask_as_attn_bias(
-            input_ids,
-            metadata
-                .as_ref()
-                .map(|(_, _)| &seqlen_offsets as &dyn PastKvLenCache)
-                .unwrap_or(&*cache as &dyn PastKvLenCache),
-            x.dtype(),
-            self.blocks[0].attn.num_attention_heads,
-        )?;
-        for (block_idx, block) in self.blocks.iter().enumerate() {
-            x = self.mapper.map(x, block_idx)?;
-            x = block.forward(
-                &x,
-                &mask.clone().map(|m| m.to_device(x.device()).unwrap()),
-                seqlen_offsets,
-                start_offsets_kernel.clone(),
-                block_idx,
-                &mut cache,
-                metadata
-                    .as_mut()
-                    .map(|(kv_cache, metadata)| (kv_cache[block_idx].clone(), &mut **metadata)),
-            )?;
+        // println!("x forward size {:?}", x.shape());
+        let (batch_size, seq_len, hidden_size) = x.dims3()?;
+
+        let num_devices = 4;
+        let chunk_size = seq_len / num_devices;
+
+        let mut chunks = Vec::with_capacity(num_devices);
+        // Handle the case where sequence length is less than number of devices
+        if seq_len < num_devices {
+            for j in 0..seq_len {
+                let chunk = x.i((.., j..j+1, ..))?;
+                chunks.push(chunk.to_device(&self.cuda_devices[j])?);
+            }
+        } else {
+            for j in 0..num_devices {
+                let start = j * chunk_size;
+                let end = if j == num_devices - 1 {
+                    seq_len
+                } else {
+                    (j+ 1) * chunk_size
+                };
+    
+                let chunk = x.i((.., start..end,..))?;
+                let device = &self.cuda_devices[j];
+                chunks.push(chunk.to_device(&device)?);
+            }
         }
-        let x = x.to_device(&self.device)?;
+
+        let mut i = 0;
+        let mut processed_chunks = Vec::new();
+        let mut target_device = &self.cuda_devices[0];
+        for (block_idx, block) in self.blocks.iter().enumerate() {
+
+            let mut block_chunks = Vec::new();
+
+            for (chunk_idx, chunk) in chunks.iter().enumerate() {
+    
+                let num_caches = self.kv_caches.len();
+                let mut accumulated_attention: Option<Tensor> = None;
+    
+                for cache_rotation in 0..num_caches {
+                    let cache_idx = (chunk_idx + cache_rotation) % num_caches;
+                    let kv_cache = &self.kv_caches[cache_idx];
+                    let mut cache = kv_cache.lock();
+    
+                    let device_chunk = chunk.device();
+    
+                    // Determine the device of the cache
+                    let cache_device = cache.iter().find_map(|opt| {
+                        opt.as_ref().map(|(k, _)| k.device().clone())
+                    }).unwrap_or_else(|| device_chunk.clone());
+    
+                    let mask = CausalMasker.make_causal_mask_as_attn_bias(
+                        input_ids,
+                        metadata
+                            .as_ref()
+                            .map(|(_, _)| &seqlen_offsets as &dyn PastKvLenCache)
+                            .unwrap_or(&*cache as &dyn PastKvLenCache),
+                        chunk.dtype(),
+                        self.blocks[0].attn.num_attention_heads,
+                    )?;
+    
+                    let mut x = self.mapper.map(chunk.to_device(&cache_device)?, block_idx)?;
+    
+                    x = block.forward(
+                        &x,
+                        &mask.clone().map(|m| m.to_device(x.device()).unwrap()),
+                        seqlen_offsets,
+                        start_offsets_kernel.clone(),
+                        block_idx,
+                        &mut cache,
+                        metadata
+                            .as_mut()
+                            .map(|(kv_cache, metadata)| (kv_cache[block_idx].clone(), &mut **metadata)),
+                    )?;
+    
+                    // Accumulate attention results
+                    if let Some(ref mut acc) = accumulated_attention {
+                        *acc = acc.add(&x.to_device(acc.device())?)?;
+                    } else {
+                        accumulated_attention = Some(x);
+                    }
+    
+                }
+    
+                // Add the accumulated attention for this chunk to block_chunks
+                if let Some(acc) = accumulated_attention {
+                    block_chunks.push(acc);
+                }
+            }
+
+            // Concatenate chunks for this block
+            let mut x = candle_core::Tensor::cat(&block_chunks, 1)?;
+            let residual = x.clone();
+            let mut x = block.mlp.forward(&x)?;
+            x = (x + &residual)?;
+            x = x.to_device(&target_device)?;
+            processed_chunks.push(x.clone());  
+        }
+        x = candle_core::Tensor::cat(&processed_chunks, 1)?;
         let mut x = self.ln_f.forward(&x)?;
         if matches!(self.lm_head, QMatMul::QTensor(_)) {
             x = x.to_dtype(DType::F32)?;
@@ -413,6 +493,9 @@ impl Llama {
         normal_loading_metadata: NormalLoadingMetadata,
         attention_mechanism: AttentionImplementation,
     ) -> Result<Self> {
+
+        let num_devices = 4;
+        let mut cuda_devices = Vec::with_capacity(num_devices);
         let mapper = normal_loading_metadata
             .mapper
             .into_mapper(cfg.num_hidden_layers, &normal_loading_metadata.real_device)?;
@@ -460,6 +543,9 @@ impl Llama {
                             .expect("Failed to create PagedAttention"),
                         ),
                     };
+                    if !cuda_devices.iter().any(|d| format!("{:?}", d) == format!("{:?}", device)) {
+                        cuda_devices.push(device.clone());
+                    }
                     Block::load(
                         vb.pp(&format!("model.layers.{i}")),
                         cfg,
@@ -472,13 +558,21 @@ impl Llama {
                     .expect("Failed to load block.")
                 })
                 .collect();
+        let mut kv_caches: Vec<crate::pipeline::Cache> = Vec::with_capacity(num_devices);
+
+        for device_id in 0..num_devices {
+            let cache = crate::pipeline::Cache::new(cfg.num_hidden_layers , false);
+            kv_caches.push(cache);
+        };
 
         Ok(Self {
             wte,
             blocks,
             ln_f,
             lm_head: QMatMul::Tensor(lm_head.weight().clone()),
-            kv_cache: crate::pipeline::Cache::new(cfg.num_hidden_layers, false),
+            kv_caches,
+            cuda_devices,
+            //kv_cache: crate::pipeline::Cache::new(cfg.num_hidden_layers, false),
             device: normal_loading_metadata.real_device,
             mapper,
             cfg: ModelConfigMetadata {
@@ -551,7 +645,8 @@ impl NormalModel for Llama {
         unimplemented!()
     }
     fn cache(&self) -> &crate::pipeline::Cache {
-        &self.kv_cache
+        &self.kv_caches[0]
+        //&self.kv_cache
     }
     fn device(&self) -> &Device {
         &self.device

@@ -425,11 +425,18 @@ impl Llama {
     
                     let device_chunk = chunk.device();
     
-                    // Determine the device of the cache
-                    let cache_device = cache.iter().find_map(|opt| {
+                    // Determine the original device of the cache
+                    let original_cache_device = cache.iter().find_map(|opt| {
                         opt.as_ref().map(|(k, _)| k.device().clone())
                     }).unwrap_or_else(|| device_chunk.clone());
-    
+
+                    // Move cache to chunk device
+                    let cache_on_chunk_device: Vec<_> = cache.iter().map(|opt| {
+                        opt.as_ref().map(|(k, v)| {
+                            (k.to_device(device_chunk).unwrap(), v.to_device(device_chunk).unwrap())
+                        })
+                    }).collect();
+
                     let mask = CausalMasker.make_causal_mask_as_attn_bias(
                         input_ids,
                         metadata
@@ -440,7 +447,8 @@ impl Llama {
                         self.blocks[0].attn.num_attention_heads,
                     )?;
     
-                    let mut x = self.mapper.map(chunk.to_device(&cache_device)?, block_idx)?;
+                    // let mut x = self.mapper.map(chunk.to_device(&cache_device)?, block_idx)?;
+                    let mut x = self.mapper.map(chunk.clone(), block_idx)?;
     
                     x = block.forward(
                         &x,
@@ -460,6 +468,13 @@ impl Llama {
                     } else {
                         accumulated_attention = Some(x);
                     }
+
+                    // Move cache back to its original device
+                    *cache = cache_on_chunk_device.into_iter().map(|opt| {
+                        opt.map(|(k, v)| {
+                            (k.to_device(&original_cache_device).unwrap(), v.to_device(&original_cache_device).unwrap())
+                        })
+                    }).collect();
     
                 }
     
@@ -471,6 +486,8 @@ impl Llama {
 
             // Concatenate chunks for this block
             let mut x = candle_core::Tensor::cat(&block_chunks, 1)?;
+
+            // do feedforward after attention has been run for each chunk
             let residual = x.clone();
             let mut x = block.mlp.forward(&x)?;
             x = (x + &residual)?;

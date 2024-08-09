@@ -431,7 +431,7 @@ impl Llama {
                     }).unwrap_or_else(|| device_chunk.clone());
 
                     // Move cache to chunk device
-                    let cache_on_chunk_device: Vec<_> = cache.iter().map(|opt| {
+                    let mut cache_on_chunk_device: Vec<_> = cache.iter().map(|opt| {
                         opt.as_ref().map(|(k, v)| {
                             (k.to_device(device_chunk).unwrap(), v.to_device(device_chunk).unwrap())
                         })
@@ -450,16 +450,29 @@ impl Llama {
                     // let mut x = self.mapper.map(chunk.to_device(&cache_device)?, block_idx)?;
                     let mut x = self.mapper.map(chunk.clone(), block_idx)?;
     
+                    // x = block.forward(
+                    //     &x,
+                    //     &mask.clone().map(|m| m.to_device(x.device()).unwrap()),
+                    //     seqlen_offsets,
+                    //     start_offsets_kernel.clone(),
+                    //     block_idx,
+                    //     &mut cache_on_chunk_device,
+                    //     metadata
+                    //         .as_mut()
+                    //         .map(|(kv_cache, metadata)| (kv_cache[block_idx].clone(), &mut **metadata)),
+                    // )?;
+
+                    let forward_device = x.device();
                     x = block.forward(
                         &x,
-                        &mask.clone().map(|m| m.to_device(x.device()).unwrap()),
-                        seqlen_offsets,
-                        start_offsets_kernel.clone(),
+                        &mask.clone().map(|m| m.to_device(&forward_device).unwrap()),
+                        seqlen_offsets.to_device(&forward_device)?,
+                        start_offsets_kernel.clone().to_device(&forward_device)?,
                         block_idx,
-                        &mut cache,
+                        &mut cache_on_chunk_device,
                         metadata
                             .as_mut()
-                            .map(|(kv_cache, metadata)| (kv_cache[block_idx].clone(), &mut **metadata)),
+                            .map(|(kv_cache, metadata)| (kv_cache[block_idx].clone().to_device(&forward_device)?, &mut **metadata)),
                     )?;
     
                     // Accumulate attention results

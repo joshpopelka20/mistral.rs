@@ -469,7 +469,7 @@ impl Llama {
                         seqlen_offsets,
                         start_offsets_kernel.clone().to_device(&forward_device)?,
                         block_idx,
-                        &mut cache_on_chunk_device,
+                        &mut cache_on_chunk_device.clone(),
                         metadata
                             .as_mut()
                             .map(|(kv_cache, metadata)| (cache_on_chunk_device[block_idx].clone().unwrap(), &mut **metadata)),

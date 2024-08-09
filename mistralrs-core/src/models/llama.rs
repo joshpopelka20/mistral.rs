@@ -472,7 +472,13 @@ impl Llama {
                         &mut cache_on_chunk_device.clone(),
                         metadata
                             .as_mut()
-                            .map(|(kv_cache, metadata)| (kv_cache[block_idx].clone().to_device(&forward_device)?, &mut **metadata)),
+                            .map(|(kv_cache, metadata)| {
+                                let (tensor1, tensor2) = kv_cache[block_idx].clone();
+                                (
+                                    (tensor1.to_device(&forward_device)?, tensor2.to_device(&forward_device)?),
+                                    &mut **metadata
+                                )
+                            }),
                     )?;
     
                     // Accumulate attention results

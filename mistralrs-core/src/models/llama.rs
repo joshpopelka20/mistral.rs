@@ -413,7 +413,11 @@ impl Llama {
 
             let mut block_chunks = Vec::new();
 
+            println!("block_idx {:?}", block_idx);
+
             for (chunk_idx, chunk) in chunks.iter().enumerate() {
+
+                println!("chunk_idx {:?}", chunk_idx);
     
                 let num_caches = self.kv_caches.len();
                 let mut accumulated_attention: Option<Tensor> = None;
@@ -422,6 +426,8 @@ impl Llama {
                     let cache_idx = (chunk_idx + cache_rotation) % num_caches;
                     let kv_cache = &self.kv_caches[cache_idx];
                     let mut cache = kv_cache.lock();
+
+                    println!("cache_idx {:?}", cache_idx);
     
                     let device_chunk = chunk.device();
     
@@ -463,6 +469,8 @@ impl Llama {
                     // )?;
 
                     let forward_device = x.device();
+
+                    println!("before block forward");
                     x = block.forward(
                         &x,
                         &mask.clone().map(|m| m.to_device(&forward_device).unwrap()),
@@ -480,6 +488,8 @@ impl Llama {
                                 )
                             }),
                     )?;
+
+                    println!("after block forward");
     
                     // Accumulate attention results
                     if let Some(ref mut acc) = accumulated_attention {

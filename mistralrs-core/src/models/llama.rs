@@ -466,13 +466,13 @@ impl Llama {
                     x = block.forward(
                         &x,
                         &mask.clone().map(|m| m.to_device(&forward_device).unwrap()),
-                        seqlen_offsets.to_device(&forward_device)?,
+                        seqlen_offsets,
                         start_offsets_kernel.clone().to_device(&forward_device)?,
                         block_idx,
                         &mut cache_on_chunk_device,
                         metadata
                             .as_mut()
-                            .map(|(kv_cache, metadata)| (kv_cache[block_idx].clone().to_device(&forward_device)?, &mut **metadata)),
+                            .map(|(kv_cache, metadata)| (kv_cache[block_idx].clone(), &mut **metadata)),
                     )?;
     
                     // Accumulate attention results

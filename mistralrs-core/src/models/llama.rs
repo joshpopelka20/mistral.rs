@@ -498,12 +498,12 @@ impl Llama {
                         accumulated_attention = Some(x);
                     }
 
-                    // Move cache back to its original device
-                    *cache = cache_on_chunk_device.into_iter().map(|opt| {
-                        opt.map(|(k, v)| {
-                            (k.to_device(&original_cache_device).unwrap(), v.to_device(&original_cache_device).unwrap())
-                        })
-                    }).collect();
+                    // // Move cache back to its original device
+                    // *cache = cache_on_chunk_device.into_iter().map(|opt| {
+                    //     opt.map(|(k, v)| {
+                    //         (k.to_device(&original_cache_device).unwrap(), v.to_device(&original_cache_device).unwrap())
+                    //     })
+                    // }).collect();
     
                 }
     

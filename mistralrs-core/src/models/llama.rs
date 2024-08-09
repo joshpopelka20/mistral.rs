@@ -523,11 +523,14 @@ impl Llama {
             x = x.to_device(&target_device)?;
             processed_chunks.push(x.clone());  
         }
+
+        println!("after blocks");
         x = candle_core::Tensor::cat(&processed_chunks, 1)?;
         let mut x = self.ln_f.forward(&x)?;
         if matches!(self.lm_head, QMatMul::QTensor(_)) {
             x = x.to_dtype(DType::F32)?;
         }
+        println!("before logits");
         let logits = MatMul.qmatmul(&x, &self.lm_head)?;
         extract_logits(&logits, context_lens)
     }

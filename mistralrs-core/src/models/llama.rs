@@ -532,7 +532,14 @@ impl Llama {
         }
         println!("before logits");
         let logits = MatMul.qmatmul(&x, &self.lm_head)?;
-        extract_logits(&logits, context_lens)
+        // extract_logits(&logits, context_lens)
+        let extracted_logits = extract_logits(&logits, context_lens);
+
+        // Add logging
+        println!("Extracted logits: {:?}", extracted_logits);
+
+        // Return the result
+        extracted_logits
     }
 
     pub fn new(
